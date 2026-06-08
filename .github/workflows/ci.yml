@@ -35,4 +35,4 @@ jobs:
       - name: Test
         run: npm test
         env:
-          ANTHROPIC_API_KEY: test-key
+          OPENROUTER_API_KEY: test-key

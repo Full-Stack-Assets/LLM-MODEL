@@ -24,7 +24,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.68.0",
+    "openai": "^4.103.0",
     "@langchain/core": "^0.3.24",
     "@langchain/langgraph": "^0.2.22",
     "@modelcontextprotocol/sdk": "^1.0.4",

@@ -1,4 +1,4 @@
-import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
 import {
   BaseMessage,
   HumanMessage,
@@ -7,23 +7,27 @@ import {
 } from '@langchain/core/messages';
 import { ModelResponse, ToolCall, ToolDefinition } from '../types';
 
-const MODEL_NAME = 'claude-opus-4-8';
-// Non-streaming request, so keep max_tokens under the SDK HTTP-timeout
-// threshold (~16K) per Anthropic guidance.
+// Use OPENROUTER_MODEL env var to override the default model at deploy time.
+const MODEL_NAME =
+  process.env.OPENROUTER_MODEL || 'anthropic/claude-opus-4-8';
+// Non-streaming request, so keep max_tokens under typical provider limits.
 const MAX_TOKENS = 16000;
 
 export class ClaudeService {
   // Constructed lazily so importing this module (and its singleton) is cheap and
   // side-effect-free — letting the startup env-validation run and report a
   // friendly error before any client is built.
-  private _client: Anthropic | null = null;
+  private _client: OpenAI | null = null;
 
-  private get client(): Anthropic {
+  private get client(): OpenAI {
     if (!this._client) {
-      if (!process.env.ANTHROPIC_API_KEY) {
-        throw new Error('ANTHROPIC_API_KEY is not set');
+      if (!process.env.OPENROUTER_API_KEY) {
+        throw new Error('OPENROUTER_API_KEY is not set');
       }
-      this._client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+      this._client = new OpenAI({
+        apiKey: process.env.OPENROUTER_API_KEY,
+        baseURL: 'https://openrouter.ai/api/v1',
+      });
     }
     return this._client;
   }
@@ -33,41 +37,44 @@ export class ClaudeService {
     tools: ToolDefinition[] = [],
     workingDirectory?: string
   ): Promise<ModelResponse> {
-    const anthropicMessages = this.convertMessages(messages);
+    const chatMessages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+      { role: 'system', content: this.buildSystemPrompt(workingDirectory) },
+      ...this.convertMessages(messages),
+    ];
 
-    const params: Anthropic.MessageCreateParams = {
+    const params: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming = {
       model: MODEL_NAME,
       max_tokens: MAX_TOKENS,
-      system: this.buildSystemPrompt(workingDirectory),
-      messages: anthropicMessages,
+      messages: chatMessages,
     };
 
     if (tools.length > 0) {
       params.tools = this.convertTools(tools);
     }
 
-    const response = await this.client.messages.create(params);
+    const response = await this.client.chat.completions.create(params);
+    const choice = response.choices[0];
+    const msg = choice.message;
 
-    // Split the content blocks into text and tool-use calls.
     const textParts: { type: 'text'; text: string }[] = [];
     const functionCalls: ModelResponse['function_calls'] = [];
 
-    for (const block of response.content) {
-      if (block.type === 'text') {
-        textParts.push({ type: 'text', text: block.text });
-      } else if (block.type === 'tool_use') {
-        functionCalls.push({
-          id: block.id,
-          name: block.name,
-          args: (block.input as Record<string, unknown>) || {},
-        });
-      }
+    if (msg.content) {
+      textParts.push({ type: 'text', text: msg.content });
+    }
+
+    for (const tc of msg.tool_calls ?? []) {
+      functionCalls.push({
+        id: tc.id,
+        name: tc.function.name,
+        args: JSON.parse(tc.function.arguments || '{}'),
+      });
     }
 
     return {
       content: textParts,
       function_calls: functionCalls,
-      stop_reason: response.stop_reason === 'tool_use' ? 'tool_use' : 'end_turn',
+      stop_reason: choice.finish_reason === 'tool_calls' ? 'tool_use' : 'end_turn',
     };
   }
 
@@ -103,67 +110,62 @@ Be direct, use tools proactively, and complete tasks efficiently.`;
   }
 
   /**
-   * Convert LangChain messages to the Anthropic Messages format.
+   * Convert LangChain messages to the OpenAI chat completions format.
    *
-   * Anthropic requires every `tool_result` to reference a `tool_use` that
+   * OpenRouter requires every tool message to reference a tool_call that
    * appears earlier in the same request. Because the conversation history is
    * loaded from the database with a row limit, the oldest messages can be
-   * truncated mid-pair — leaving a `tool_result` whose `tool_use` was cut off.
-   * We track the tool-use IDs we have emitted and drop any orphaned
-   * `tool_result` to avoid a 400 from the API.
+   * truncated mid-pair — leaving a tool message whose tool_call was cut off.
+   * We track the tool-call IDs we have emitted and drop any orphaned tool
+   * messages to avoid a 400 from the API.
    */
-  private convertMessages(messages: BaseMessage[]): Anthropic.MessageParam[] {
-    const result: Anthropic.MessageParam[] = [];
-    const seenToolUseIds = new Set<string>();
+  private convertMessages(
+    messages: BaseMessage[]
+  ): OpenAI.Chat.ChatCompletionMessageParam[] {
+    const result: OpenAI.Chat.ChatCompletionMessageParam[] = [];
+    const seenToolCallIds = new Set<string>();
 
     for (const message of messages) {
       if (message instanceof HumanMessage) {
-        result.push({
-          role: 'user',
-          content: String(message.content),
-        });
+        result.push({ role: 'user', content: String(message.content) });
       } else if (message instanceof AIMessage) {
-        const blocks: Anthropic.ContentBlockParam[] = [];
-
-        if (typeof message.content === 'string' && message.content.trim()) {
-          blocks.push({ type: 'text', text: message.content });
-        }
-
         const toolCalls = (message.tool_calls || []) as unknown as ToolCall[];
-        for (const toolCall of toolCalls) {
-          seenToolUseIds.add(toolCall.id);
-          blocks.push({
-            type: 'tool_use',
-            id: toolCall.id,
-            name: toolCall.function.name,
-            input: JSON.parse(toolCall.function.arguments || '{}'),
+        const textContent =
+          typeof message.content === 'string' ? message.content : '';
+
+        const assistantMsg: OpenAI.Chat.ChatCompletionAssistantMessageParam = {
+          role: 'assistant',
+          content: textContent || null,
+        };
+
+        if (toolCalls.length > 0) {
+          assistantMsg.tool_calls = toolCalls.map((tc) => {
+            seenToolCallIds.add(tc.id);
+            return {
+              id: tc.id,
+              type: 'function' as const,
+              function: {
+                name: tc.function.name,
+                arguments: tc.function.arguments || '{}',
+              },
+            };
           });
         }
 
-        // An assistant turn must have at least one content block.
-        if (blocks.length === 0) {
-          blocks.push({ type: 'text', text: '(no content)' });
-        }
-
-        result.push({ role: 'assistant', content: blocks });
+        result.push(assistantMsg);
       } else if (message instanceof ToolMessage) {
-        // Skip results whose originating tool_use was truncated out of history.
-        if (!seenToolUseIds.has(message.tool_call_id)) {
+        // Skip results whose originating tool_call was truncated out of history.
+        if (!seenToolCallIds.has(message.tool_call_id)) {
           continue;
         }
 
         result.push({
-          role: 'user',
-          content: [
-            {
-              type: 'tool_result',
-              tool_use_id: message.tool_call_id,
-              content:
-                typeof message.content === 'string'
-                  ? message.content
-                  : JSON.stringify(message.content),
-            },
-          ],
+          role: 'tool',
+          tool_call_id: message.tool_call_id,
+          content:
+            typeof message.content === 'string'
+              ? message.content
+              : JSON.stringify(message.content),
         });
       }
     }
@@ -172,18 +174,19 @@ Be direct, use tools proactively, and complete tasks efficiently.`;
   }
 
   /**
-   * Convert MCP/web-search tool definitions to the Anthropic tool format.
-   * Anthropic accepts standard JSON Schema directly as `input_schema`, so no
-   * Gemini-style schema cleaning is required.
+   * Convert MCP/web-search tool definitions to the OpenAI function-calling format.
    */
-  convertTools(tools: ToolDefinition[]): Anthropic.Tool[] {
+  convertTools(tools: ToolDefinition[]): OpenAI.Chat.ChatCompletionTool[] {
     return tools.map((tool) => ({
-      name: tool.name,
-      description: tool.description || 'No description provided',
-      input_schema:
-        tool.inputSchema && tool.inputSchema.type === 'object'
-          ? (tool.inputSchema as Anthropic.Tool.InputSchema)
-          : { type: 'object', properties: {} },
+      type: 'function' as const,
+      function: {
+        name: tool.name,
+        description: tool.description || 'No description provided',
+        parameters:
+          tool.inputSchema && tool.inputSchema.type === 'object'
+            ? (tool.inputSchema as OpenAI.FunctionParameters)
+            : { type: 'object', properties: {} },
+      },
     }));
   }
 }
