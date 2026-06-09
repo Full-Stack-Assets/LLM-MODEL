@@ -4,7 +4,7 @@ import type { AgentState } from '../src/agent/state';
 
 // Importing the graph pulls in the agent nodes, which construct the Claude
 // singleton; provide a dummy key so the import succeeds.
-process.env.ANTHROPIC_API_KEY = 'test-key';
+process.env.OPENROUTER_API_KEY = 'test-key';
 
 async function loadGraph() {
   return import('../src/agent/graph');
